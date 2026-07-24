@@ -7,7 +7,7 @@ authors:
   - given-names: "Janet"
     family-names: "Shin"
     affiliation: "University of California, Berkeley"
-    # orcid: "https://orcid.org/0000-0000-0000-0000"   # optional; add if provided
+    #orcid: "https://orcid.org/0000-0000-0000-0000"   # optional; add if provided
   - name: "Openwater"
     website: "https://www.openwater.health/"
 repository-code: "https://github.com/OpenwaterHealth/openlifu-closed-loop-eeg"

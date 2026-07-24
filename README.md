@@ -44,11 +44,11 @@ A sonication is permitted only when **all** of the following hold:
 
 | # | Condition | Meaning |
 |---|-----------|---------|
-| 1 | Baseline buffer complete | The 100 s calibration baseline has been collected |
+| 1 | Baseline buffer complete | The first 200 artifact-free samples must be collected |
 | 2 | Task active | The subject is engaged in the 2-back task |
 | 3 | Theta Z > 1.5 | Real-time theta power exceeds the trigger threshold |
 | 4 | Below safety ceiling (Z < 10) | Theta Z-score is under the hard safety ceiling |
-| 5 | Cooldown elapsed | At least 10 s since the previous sonication |
+| 5 | Cooldown elapsed | At least 15 s since the previous sonication |
 | 6 | Session cap not reached | Fewer than 10 sonications delivered this session |
 
 See [`docs/protocol.md`](docs/protocol.md) for the full rationale behind each
@@ -59,25 +59,30 @@ Z-score are computed.
 
 ## Run it without any human data
 
-The pipeline is runnable end-to-end with **no human recordings**. A synthetic signal
-generator ([`fixtures/synthetic_theta.py`](fixtures/synthetic_theta.py)) replays a
-configurable theta-band signal onto an LSL stream, so you can exercise acquisition,
-artifact gating, the trigger gate, and logging without an amplifier or a subject.
+Two pieces work standalone today with **no human recordings and no proprietary SDK**:
 
 ```bash
-# 1. Install (see docs/hardware-setup.md for the proprietary g.Pipe SDK step)
-pip install -e .
+pip install -e ".[dev]"
 
-# 2. Start the synthetic EEG source
+# The six-condition trigger gate, exercised directly against synthetic states --
+# no hardware, no EEG, nothing beyond this repo's own [dev] extra:
+pytest tests/test_trigger_conditions.py
+
+# A synthetic theta-band signal generator, streamed onto LSL:
 python -m fixtures.synthetic_theta
-
-# 3. Run the closed-loop pipeline against it
-python -m openlifu_closed_loop --source synthetic --dry-run
 ```
 
-`--dry-run` exercises the full trigger gate and logging path but issues **no**
-sonications. No raw EEG from the feasibility study is published in this repository;
-see [Data & human subjects](#data--human-subjects).
+> [!NOTE]
+> `python -m openlifu_closed_loop --source synthetic --dry-run` (the scaffold's CLI
+> entrypoint) is **not yet wired to anything** — it raises `NotImplementedError` by
+> design, and the actual migrated pipeline (`main_pipeline.py`) doesn't currently have a
+> synthetic-source mode to wire it to either (its acquisition step is hardwired to a real
+> g.tec amplifier). There is currently no single command that runs the full pipeline
+> end-to-end without both `gpype` and real hardware. See
+> [`docs/known-issues.md`](docs/known-issues.md#current-implementation-status).
+
+No raw EEG from the feasibility study is published in this repository; see
+[Data & human subjects](#data--human-subjects).
 
 ---
 
@@ -107,6 +112,15 @@ user-supplied dependency — you install it yourself following
 [`docs/hardware-setup.md`](docs/hardware-setup.md). The acquisition layer is abstracted
 behind an interface so a different amplifier can be supported by swapping in a new
 adapter; contributions of adapters for other hardware are welcome.
+
+**[`third_party/SlicerOpenLIFU/`](third_party/SlicerOpenLIFU) vendors one modified file**
+from Openwater's [SlicerOpenLIFU](https://github.com/OpenwaterHealth/SlicerOpenLIFU)
+extension (AGPL-3.0), separate from this repository's own Apache-2.0 license — install
+SlicerOpenLIFU normally for everything else. The default (non-`--hardware-enabled`) run
+path drives sonication by talking over TCP to a listener added to that one file
+specifically for this experiment. See
+[`third_party/SlicerOpenLIFU/README.md`](third_party/SlicerOpenLIFU/README.md) and
+[`NOTICE`](NOTICE) for what's modified and the licensing detail.
 
 ---
 

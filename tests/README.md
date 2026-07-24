@@ -1,12 +1,20 @@
 # Test suite overview
 
-These tests exercise `main_pipeline.py`'s closed-loop EEG-triggered LIFU
-logic — mainly `theta_trigger_loop()`, the function that decides, sample by
-sample, whether to fire a sonication (`LIFU_ON`/`LIFU_OFF`) based on a
+`test_trigger_conditions.py` tests the scaffold's own `triggers/` module and needs
+nothing beyond this repo's `[dev]` extra (`pip install -e ".[dev]"`).
+
+The other files below (`mad_threshold_test.py`, `num_sonications_test.py`,
+`psychopy_stop_marker_test.py`, `theta_lifu_validation_test.py`,
+`trigger_accuracy_test.py`) exercise the migrated `main_pipeline.py`'s closed-loop
+EEG-triggered LIFU logic — mainly `theta_trigger_loop()`, the function that decides,
+sample by sample, whether to fire a sonication (`LIFU_ON`/`LIFU_OFF`) based on a
 rolling theta-band signal. Hardware bindings (`openlifu`) aren't required:
 every test stubs that package out so `main_pipeline` can be imported and its
 decision logic run in isolation, with LSL outlets swapped for simple
-in-memory recorders.
+in-memory recorders. `gpype` **is** required (imported unconditionally by
+`main_pipeline.py`, not stubbed) — these five will fail to collect without it. Install
+`pip install -r requirements-test.txt` first (see also
+[`known-issues.md`](../docs/known-issues.md#current-implementation-status)).
 
 Run an individual file directly with `python`, or the pytest-based ones with
 `pytest`. Each file's own usage line is in its module docstring.

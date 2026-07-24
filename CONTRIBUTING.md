@@ -24,10 +24,17 @@ org, so signing is a one-time, in-PR step. External contributions will be gated 
 
 ```bash
 pip install -e ".[dev]"
-pytest                      # runs the test suite, including one test per trigger condition
-python -m fixtures.synthetic_theta            # synthetic EEG source, no human data
-python -m openlifu_closed_loop --source synthetic --dry-run
+pytest tests/test_trigger_conditions.py  # one test per trigger condition; no extra deps
+python -m fixtures.synthetic_theta       # synthetic EEG source, no human data
 ```
+
+A bare `pytest` (no path) will also try to collect the migrated `main_pipeline.py`
+tests under `tests/`, which need `gpype`/`pyxdf` (`pip install -r requirements-test.txt`)
+and currently **abort the whole run with collection errors** if those aren't installed —
+see [`tests/README.md`](tests/README.md). `python -m openlifu_closed_loop --source
+synthetic --dry-run` is scaffolding that currently just raises `NotImplementedError` by
+design; it is not yet wired to `main_pipeline.py`. See
+[`docs/known-issues.md`](docs/known-issues.md#current-implementation-status).
 
 ## The safety-critical module
 

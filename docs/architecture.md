@@ -1,5 +1,13 @@
 # Architecture
 
+> [!NOTE]
+> This document describes the **intended** module boundaries. The migrated pipeline
+> (`src/openlifu_closed_loop/main_pipeline.py`) does not currently implement this split —
+> acquisition, artifact gating, task control, sonication, and logging all still live
+> together in one file. `triggers/` is the one module below that *is* actually split out
+> and wired up as described. See
+> [`known-issues.md`](known-issues.md#current-implementation-status) for the concrete gap.
+
 The pipeline is a set of loosely coupled modules connected over
 [Lab Streaming Layer (LSL)](https://labstreaminglayer.readthedocs.io/). LSL gives every
 module a shared clock and lets components be developed, tested, and replaced

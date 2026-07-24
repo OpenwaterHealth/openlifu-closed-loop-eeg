@@ -33,6 +33,20 @@ from openlifu.geo import Point
 from openlifu.io.LIFUInterface import LIFUInterface
 from openlifu.plan.solution import Solution
 
+# Single source of truth for the six trigger-condition thresholds: triggers/conditions.py
+# is the reviewed, tested, safety-critical module (see docs/protocol.md). Imported here as
+# this loop's *default* values so both stay numerically in sync; still overridable per-call
+# (the test suite relies on that -- e.g. cooldown_time=0.0 to run fast) so this loop can't
+# just call may_sonicate()/blocking_conditions() directly, which read these as fixed
+# constants with no override hook.
+from openlifu_closed_loop.triggers.conditions import (
+    BASELINE_SECONDS,
+    COOLDOWN_SECONDS,
+    SESSION_CAP,
+    THETA_CEILING_Z,
+    THETA_TRIGGER_Z,
+)
+
 
 # ============================================================
 # Run configuration (paths, output dirs, mode flags)
@@ -141,7 +155,7 @@ def _find_labrecorder_exe() -> Path | None:
     entirely (e.g. outside this repo).
     """
     matches = sorted(
-        Path(__file__).resolve().parent.glob("LabRecorder*/LabRecorder.exe"),
+        Path(__file__).resolve().parent.parent.parent.glob("LabRecorder*/LabRecorder.exe"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -292,7 +306,7 @@ def stop_lab_recorder(proc: subprocess.Popen | None, started: bool) -> None: # C
 # OW_NO_PSYCHOPY=1 to skip auto-launching it and start the task by hand.
 PSYCHOPY_SCRIPT = Path(os.environ.get(
     "OW_PSYCHOPY_SCRIPT",
-    str(Path(__file__).resolve().parent / "n-back-task-with-visual-stimuli" / "N-back_lastrun.py"),
+    str(Path(__file__).resolve().parent.parent.parent / "n-back-task-with-visual-stimuli" / "N-back_lastrun.py"),
 ))
 # No portable default exists for the PsychoPy standalone interpreter -- it's
 # an external install, not part of this repo. Must be set via env var.
@@ -592,21 +606,35 @@ THETA_CHANNEL_INDEX = _router_channel_index(ROUTER_INPUT_CHANNELS, "hold")  # ch
 # ============================================================
 
 SONICATION_TIME = 5 # seconds
-COOLDOWN_TIME = 15 #sonication time + cooldown time
-THETA_THRESHOLD_Z = 1.5    # z-score threshold
+
+# Reconciled with triggers/conditions.py (see the import above): these four now default
+# to that module's values instead of a separate, possibly-drifted local copy.
+# COOLDOWN_TIME was 15 here vs. 10 in conditions.py before reconciliation; 15 is the
+# value actually used in the feasibility study, so conditions.py's COOLDOWN_SECONDS (and
+# its test and docs/protocol.md) were updated to 15 to match, rather than the other way
+# around. THETA_THRESHOLD_Z / ABS_VALUE_CUTOFF / MAX_SONICATIONS already agreed with
+# triggers/conditions.py's values, so aliasing them here just removes the duplication.
+COOLDOWN_TIME = COOLDOWN_SECONDS
+THETA_THRESHOLD_Z = THETA_TRIGGER_Z
+ABS_VALUE_CUTOFF = THETA_CEILING_Z
+MAX_SONICATIONS = SESSION_CAP
+
 MU = 2.32
 SIGMA =  6.60
-MAD_THRESHOLD = 10      # for artifact rejection in baseline collection
-ABS_VALUE_CUTOFF = 10 # CHANGE FOR ACTUAL TESTING   # absolute ceiling on theta_val itself, guards against slow drift/corruption that a rolling MAD check can't catch
+MAD_THRESHOLD = 10      # for artifact rejection in baseline collection -- not one of the
+                         # six trigger conditions; MAD/artifact gating runs upstream of them
 INITIAL_CUTOFF = 25.0   # initial power threshold to exclude extreme artifacts
 BUFFER_SIZE = 500
-BUFFER_COLLECTION_SIZE = 200 # minimum amount of samples to collect before starting to check for theta threshold crossings
-MAX_SONICATIONS = 10   # cap on NUM_SONICATIONS per run
+BUFFER_COLLECTION_SIZE = 200 # minimum amount of samples to collect before the MAD buffer's
+                              # own median/MAD statistics are considered stable enough to use.
+                              # This is a separate concern from trigger condition 1 (baseline
+                              # complete) below -- see theta_trigger_loop's baseline_seconds.
 
 
 # Two independent readiness signals, set by two separate threads
 # from listen_for_start_stop() and theta_trigger_loop() itself
-baseline_ready = False # baseline finished collecting 200 samples
+baseline_ready = False # trigger condition 1: BASELINE_SECONDS of elapsed wall-clock time
+                        # collected (see theta_trigger_loop), not a sample count
 psychopy_running = False # can only sonicate while psychopy is running
 
 
@@ -667,10 +695,20 @@ def theta_trigger_loop(
     initial_cutoff=INITIAL_CUTOFF,
     buffer_size=BUFFER_SIZE,
     buffer_collection_size=BUFFER_COLLECTION_SIZE,
+    baseline_seconds=BASELINE_SECONDS,
     max_sonications=MAX_SONICATIONS,
 ):
     """Applies theta-thresholding + cooldown/artifact-rejection logic to a
-    stream of (theta_val, ts) pairs and sends LIFU_ON/OFF markers over LSL."""
+    stream of (theta_val, ts) pairs and sends LIFU_ON/OFF markers over LSL.
+
+    The six conditions checked below mirror triggers/conditions.py's may_sonicate() one
+    for one (condition 1 = baseline_seconds, 2 = psychopy_running, 3 = theta_threshold_z,
+    4 = abs_value_cutoff, 5 = cooldown_time, 6 = max_sonications), using the same default
+    values. It's not implemented as a call to may_sonicate() itself because every one of
+    those defaults is overridden per-call somewhere in this repo's test suite (e.g.
+    cooldown_time=0.0, max_sonications=1, to keep tests fast) and conditions.py's
+    predicates read their thresholds as fixed module constants with no override hook.
+    """
     global baseline_ready
     NUM_SONICATIONS = 0
     if sample_source is None:
@@ -680,6 +718,7 @@ def theta_trigger_loop(
     #theta_history = []
     last_trigger_time = 0
     last_theta_val = None
+    baseline_start_ts = None  # set to the first sample's LSL timestamp, below
     logger.info("Starting theta-based closed-loop monitoring...")
     buffer = []
 
@@ -690,6 +729,8 @@ def theta_trigger_loop(
         if last_theta_val is not None and theta_val == last_theta_val:
             continue
         last_theta_val = theta_val
+        if baseline_start_ts is None:
+            baseline_start_ts = ts
         # update rolling buffer
         # not enough data yet → just collect
         if len(buffer) <= buffer_collection_size:
@@ -697,10 +738,6 @@ def theta_trigger_loop(
                 buffer.append(theta_val)
                 eeg_trigger_outlet.push_sample(["collecting_baseline"])
             continue
-        if not baseline_ready:
-            baseline_ready = True
-            logger.info("Baseline collection complete (%d samples). Sonication gate open.", len(buffer))
-            eeg_trigger_outlet.push_sample(["baseline_collection_complete"])
         if len(buffer) > buffer_size:
             buffer.pop(0)
 
@@ -726,6 +763,18 @@ def theta_trigger_loop(
         buffer.append(theta_val)
 
         now = ts
+        # Trigger condition 1: baseline_seconds of real elapsed time collected, matching
+        # triggers/conditions.py's baseline_complete() and docs/protocol.md's "100 s
+        # calibration baseline" -- not the buffer_collection_size sample count above,
+        # which is a separate, internal MAD-buffer warm-up threshold.
+        baseline_seconds_collected = now - baseline_start_ts
+        if not baseline_ready and baseline_seconds_collected >= baseline_seconds:
+            baseline_ready = True
+            logger.info(
+                "Baseline collection complete (%.1fs elapsed). Sonication gate open.",
+                baseline_seconds_collected,
+            )
+            eeg_trigger_outlet.push_sample(["baseline_collection_complete"])
         logger.debug("baseline_ready=%s sonication_enabled=%s", baseline_ready, psychopy_running)
 
         if (
@@ -733,7 +782,7 @@ def theta_trigger_loop(
             and psychopy_running
             and theta_val < abs_value_cutoff
             and theta_val > theta_threshold_z
-            and (now - last_trigger_time) > cooldown_time
+            and (now - last_trigger_time) >= cooldown_time
             and NUM_SONICATIONS < max_sonications
         ):
             logger.info(f"Theta threshold crossed: z={theta_val:.2f}. Triggering LIFU.")
@@ -835,7 +884,7 @@ def build_pipeline() -> tuple[gp.Pipeline, subprocess.Popen | None]:
 
     visualizer_proc = None
     if not os.environ.get("OW_NO_VISUALIZER"):
-        visualizer_path = Path(__file__).resolve().parent / "lsl_visualizer.py"
+        visualizer_path = Path(__file__).resolve().parent.parent.parent / "scripts" / "lsl_visualizer.py"
         try:
             visualizer_proc = subprocess.Popen(
                 [sys.executable, str(visualizer_path)], **_SUBPROCESS_KWARGS
