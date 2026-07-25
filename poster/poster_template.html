@@ -66,7 +66,13 @@
     position:relative; overflow:hidden; background:var(--black); color:#fff;
     padding:88px 0 56px 0;
   }
-  .hero canvas{position:absolute; inset:0; width:100%; height:100%; opacity:0.55;}
+  .hero video{
+    position:absolute; top:0; right:0; bottom:0; left:auto;
+    width:62%; height:100%; object-fit:cover; opacity:0.55;
+    mask-image:linear-gradient(to right, transparent, black 15%);
+    -webkit-mask-image:linear-gradient(to right, transparent, black 15%);
+  }
+  @media (max-width:700px){ .hero video{width:100%; opacity:0.35;} }
   .hero-inner{position:relative; z-index:2;}
   .hero .eyebrow{color:var(--blue);}
   .hero h1{
@@ -357,7 +363,7 @@
 </nav>
 
 <header class="hero">
-  <canvas id="waveCanvas"></canvas>
+  <video src="__VIDEO_SONICATION__" autoplay muted loop playsinline></video>
   <div class="wrap hero-inner">
     <span class="eyebrow">Closed-Loop EEG-Guided Open-LIFU &middot; Feasibility Pilot</span>
     <h1>Stimulate the Brain Without Ever Losing Signal</h1>
@@ -1069,35 +1075,4 @@
     window.addEventListener('keydown', function(e){ if(e.key==='Escape') lb.classList.remove('open'); });
   })();
 
-  // ---- hero wave canvas ----
-  (function(){
-    var canvas = document.getElementById('waveCanvas');
-    var ctx = canvas.getContext('2d');
-    var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    var w,h,dpr=Math.min(window.devicePixelRatio||1,2);
-    function resize(){
-      w = canvas.clientWidth; h = canvas.clientHeight;
-      canvas.width = w*dpr; canvas.height = h*dpr;
-      ctx.setTransform(dpr,0,0,dpr,0,0);
-    }
-    window.addEventListener('resize', resize);
-    resize();
-    var cx = ()=> w*0.78, cy = ()=> h*0.28;
-    function frame(t){
-      ctx.clearRect(0,0,w,h);
-      var rings = 5;
-      for(var i=0;i<rings;i++){
-        var phase = reduced ? i/rings : ((t/2600)+i/rings)%1;
-        var r = phase * Math.max(w,h) * 0.85;
-        var alpha = (1-phase) * 0.35;
-        ctx.beginPath();
-        ctx.arc(cx(), cy(), r, 0, Math.PI*2);
-        ctx.strokeStyle = 'rgba(77,159,255,'+alpha.toFixed(3)+')';
-        ctx.lineWidth = 1.4;
-        ctx.stroke();
-      }
-      if(!reduced) requestAnimationFrame(frame);
-    }
-    requestAnimationFrame(frame);
-  })();
 </script>

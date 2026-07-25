@@ -17,6 +17,7 @@ mapping = {
     "__IMG_GTEC__": img_dir / "bcicore8.jpg",
     "__IMG_TTL_TRIGGER__": img_dir / "ttl_trigger_pulse_train.png",
     "__VIDEO_2BACK__": video_dir / "2back_task.mp4",
+    "__VIDEO_SONICATION__": video_dir / "sonication_visual.mp4",
 }
 
 html = (here / "poster_template.html").read_text(encoding="utf-8")
