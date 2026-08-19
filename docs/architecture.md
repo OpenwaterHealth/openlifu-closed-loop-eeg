@@ -43,8 +43,8 @@ independently.
         └──────────────────────┘
 ```
 
-Every stream carries LSL timestamps, so acquisition, task markers, trigger decisions,
-and sonication events can all be aligned to a common clock offline.
+Every stream carries LSL timestamps, so acquisition, task markers, video markers,
+trigger decisions, and sonication events can all be aligned to a common clock offline.
 
 ---
 
@@ -97,3 +97,12 @@ material for offline latency and safety analysis.
   samples that passed the MAD gate.
 - **Everything is timestamped.** No decision is made without a corresponding logged
   record on the shared LSL clock.
+
+---
+
+### `video/`
+Publishes behavioral video markers onto LSL so video events can be aligned with EEG,
+task, trigger, and sonication events on the shared LSL clock.
+
+The module publishes marker strings only; video capture and storage are intentionally
+out of scope.
