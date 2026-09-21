@@ -750,7 +750,7 @@
   // ---- nav scroll-spy + smooth scroll ----
   (function(){
     var links = Array.prototype.slice.call(document.querySelectorAll('.nav-pill'));
-    var map = links.map(function(a){ return { a:a, el: document.getElementById(a.getAttribute('href').slice(1)) }; }).filter(function(m){return m.el;});
+    var map = links.map(function(a){ return { a:a, el: document.getElementById(a.hash.slice(1)) }; }).filter(function(m){return m.el;});
     var obs = new IntersectionObserver(function(entries){
       entries.forEach(function(entry){
         var m = map.find(function(x){return x.el===entry.target;});
@@ -762,7 +762,7 @@
     links.forEach(function(a){
       a.addEventListener('click', function(e){
         e.preventDefault();
-        var el = document.getElementById(a.getAttribute('href').slice(1));
+        var el = document.getElementById(a.hash.slice(1));
         if(el) el.scrollIntoView({behavior:'smooth', block:'start'});
       });
     });
