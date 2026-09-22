@@ -1,14 +1,14 @@
 """Closed-loop LIFU–EEG reference implementation (research use only).
 
 Modules:
-    acquisition     — g.Pipe SDK adapter → LSL (abstracted for other amplifiers)
-    artifact_gating — MAD gate over a 500-sample rolling buffer
     triggers        — the six-condition safety-critical gate
-    task            — PsychoPy 2-back working-memory task
-    lifu            — openlifu-python sonication interface
-    logging         — timestamped event logging across all streams
+    main_pipeline    — acquisition, artifact gating, task control, LIFU
+                        sonication, and logging, migrated in as-is (not yet
+                        split into separate modules)
+    EEG_calibration  — standalone script to derive the theta Z-score's MU/SIGMA
 
-See docs/architecture.md for how these connect over Lab Streaming Layer.
+See docs/architecture.md for the original module boundaries this may still be
+split into.
 """
 
 __version__ = "0.1.0"

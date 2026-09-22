@@ -1,0 +1,39 @@
+# Dependencies for the migrated pipeline code:
+# src/openlifu_closed_loop/main_pipeline.py and EEG_calibration.py,
+# plus scripts/lsl_visualizer.py.
+#
+# Install with:  pip install -r requirements.txt
+# Python 3.10+ recommended.
+#
+# Not part of this repo's own pyproject.toml [dev] extra -- gpype is
+# proprietary (not on a public index; see docs/hardware-setup.md) and
+# openlifu is AGPL-3.0 (see NOTICE), so neither is declared there.
+
+# Numerical
+numpy>=2.0
+
+# Lab Streaming Layer - EEG/marker transport between the g.Pype pipeline,
+# PsychoPy tasks, and the recorder threads
+pylsl>=1.18
+
+# g.Pype - g.tec BCI signal-processing pipeline (BCICore8 source, filters,
+# TimeSeriesScope, LSLSender, CsvWriter). Also pulls in a Qt backend.
+gpype>=3.0
+
+# OpenLIFU - Low-Intensity Focused Ultrasound hardware interface
+# (openlifu.io.LIFUInterface, beamforming, transducer/db, Pulse/Sequence/Solution)
+openlifu>=0.21
+
+# pyqtgraph - real-time plotting backend for scripts/lsl_visualizer.py
+# (launched automatically as a subprocess by main_pipeline.py's
+# build_pipeline(), unless OW_NO_VISUALIZER is set). Needs a Qt binding;
+# gpype's install usually pulls one in already.
+pyqtgraph>=0.13
+
+# ---------------------------------------------------------------------------
+# Optional extras
+# ---------------------------------------------------------------------------
+# The PsychoPy behavioral task in n-back-task-with-visual-stimuli/ was built
+# with PsychoPy Builder and is usually launched from the PsychoPy standalone
+# environment. Uncomment only if you want to run it from this venv as well.
+# psychopy

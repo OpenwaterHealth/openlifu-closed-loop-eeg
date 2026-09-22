@@ -1,0 +1,1009 @@
+from __future__ import annotations
+
+
+import argparse
+import logging
+import math
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+
+if os.name == 'nt':
+    import msvcrt
+else:
+    import select
+
+
+import numpy as np
+from pylsl import StreamInlet, resolve_byprop, StreamInfo, StreamOutlet
+
+
+import gpype as gp
+
+
+from openlifu.bf.pulse import Pulse
+from openlifu.bf.sequence import Sequence
+from openlifu.db import Database
+from openlifu.geo import Point
+from openlifu.io.LIFUInterface import LIFUInterface
+from openlifu.plan.solution import Solution
+
+# Single source of truth for the six trigger-condition thresholds: triggers/conditions.py
+# is the reviewed, tested, safety-critical module (see docs/protocol.md). Imported here as
+# this loop's *default* values so both stay numerically in sync; still overridable per-call
+# (the test suite relies on that -- e.g. cooldown_time=0.0 to run fast) so this loop can't
+# just call may_sonicate()/blocking_conditions() directly, which read these as fixed
+# constants with no override hook.
+from openlifu_closed_loop.triggers.conditions import (
+    BASELINE_SECONDS,
+    COOLDOWN_SECONDS,
+    SESSION_CAP,
+    THETA_CEILING_Z,
+    THETA_TRIGGER_Z,
+)
+
+
+# ============================================================
+# Run configuration (paths, output dirs, mode flags)
+# ============================================================
+
+# Participant/run label used for XDF, LabRecorder, and PsychoPy filenames.
+# Edit this by hand before each run.
+name_and_trial = "run_1"
+
+# all XDF output goes here (written by LabRecorder, see start_lab_recorder())
+XDF_DIR = Path("xdf_data")
+XDF_DIR.mkdir(exist_ok=True)
+
+#global variables for threads
+RUNNING = True
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the closed-loop LIFU pipeline.")
+    parser.add_argument(
+        "--hardware-enabled", action="store_true", default=False,
+        help="Connect to the LIFU hardware directly (headless) instead of relying on the Slicer GUI's Run button. Default: disabled.",
+    )
+    parser.add_argument(
+        "--sham-run", action="store_true", default=False,
+        help="Sham (placebo) run: skip hardware init and the Slicer auto-run trigger so the LIFU never sonicates. Default: disabled.",
+    )
+    return parser.parse_args()
+
+
+# ============================================================
+# Logging
+# ============================================================
+
+# logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.hasHandlers():
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
+    logger.propagate = False
+
+
+# ============================================================
+# Generic subprocess/cleanup utilities
+# ============================================================
+
+# Every subprocess we manage ourselves (LabRecorder, PsychoPy,
+# lsl_visualizer.py) is launched in its own process group on Windows
+_SUBPROCESS_KWARGS = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+
+
+def _cleanup_step(description: str, fn, *args) -> None:
+    """Runs one shutdown step in isolation. If it raises -- including a
+    second KeyboardInterrupt from an impatient extra Ctrl+C while a slow
+    step (e.g. p.stop()) is still blocking -- this logs it and lets the
+    remaining cleanup steps still run, instead of one failure silently
+    skipping everything after it in the same finally block.
+    """
+    try:
+        fn(*args)
+    except BaseException as e:
+        logger.warning("Cleanup step %r failed: %s", description, e)
+
+
+def _terminate_proc(proc: subprocess.Popen | None, timeout: float = 5.0) -> None:
+    """Terminates a subprocess we launched (PsychoPy, lsl_visualizer.py),
+    falling back to kill() if it doesn't exit within `timeout` seconds.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+# ============================================================
+# LSL outlets (created at import time)
+# ============================================================
+
+# Sending markers to EEG
+eeg_trigger_info = StreamInfo('EEG_LIFU_events', 'Markers', 1, 0, 'string')
+eeg_trigger_outlet = StreamOutlet(eeg_trigger_info)
+logger.info("LIFU to PsychoPy LSL outlet created.")
+
+
+#sending markers to psychopy
+lifu_num_info = StreamInfo('PsychoPy_numeric', 'Markers', 1, 0, 'float32')
+lifu_num_outlet = StreamOutlet(lifu_num_info)
+logger.info("LIFU to PsychoPy LSL outlet created.")
+
+
+# ============================================================
+# LabRecorder automation
+# ============================================================
+
+# Set OW_NO_LABRECORDER=1 to skip this and drive LabRecorder manually instead.
+def _find_labrecorder_exe() -> Path | None:
+    """Auto-discovers LabRecorder.exe under this repo instead of hardcoding
+    a version-specific install path, so upgrading LabRecorder (unzipping a
+    new LabRecorder-X.Y.Z-Win_amd64 folder here) doesn't require editing
+    this file. Picks the most recently modified match if more than one
+    install is found. Set OW_LABRECORDER_EXE if it lives somewhere else
+    entirely (e.g. outside this repo).
+    """
+    matches = sorted(
+        Path(__file__).resolve().parent.parent.parent.glob("LabRecorder*/LabRecorder.exe"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return matches[0] if matches else None
+
+
+_labrecorder_exe_override = os.environ.get("OW_LABRECORDER_EXE")
+LABRECORDER_EXE = Path(_labrecorder_exe_override) if _labrecorder_exe_override else _find_labrecorder_exe()
+LABRECORDER_RCS_HOST = "127.0.0.1"
+LABRECORDER_RCS_PORT = 22345
+SESSION_LABEL = os.environ.get("OW_SESSION", "1")
+
+
+def _connect_labrecorder_rcs(timeout: float) -> socket.socket | None:
+    """Repeatedly tries to open LabRecorder's remote-control TCP socket
+    until it succeeds or `timeout` seconds pass. Returns None on timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            return socket.create_connection((LABRECORDER_RCS_HOST, LABRECORDER_RCS_PORT), timeout=1.0)
+        except OSError:
+            time.sleep(0.5)
+    return None
+
+#COME BACK TO THIS
+_LABRECORDER_CFG_MARKER_BEGIN = "; --- OW_closedloopLIFU managed settings (auto-generated -- edits here are overwritten) ---"
+_LABRECORDER_CFG_MARKER_END = "; --- end OW_closedloopLIFU managed settings ---"
+_LABRECORDER_REQUIRED_STREAM_NAMES = ["EEG_gpype", "EEG_LIFU_events", "PsychoPy_numeric", "PsychoPyMarkers"]
+
+
+def _ensure_labrecorder_cfg() -> None:
+    """Writes StudyRoot/RequiredStreams/RCSEnabled directly into
+    LabRecorder.cfg (next to LABRECORDER_EXE) before launching it so that it routes to the correct location (instead of default). """
+    cfg_path = LABRECORDER_EXE.parent / "LabRecorder.cfg"
+    hostname = socket.gethostname()
+    required_streams = ",".join(
+        f'"{name} ({hostname})"' for name in _LABRECORDER_REQUIRED_STREAM_NAMES
+    )
+    managed_block = "\n".join([
+        _LABRECORDER_CFG_MARKER_BEGIN,
+        f"StudyRoot={XDF_DIR.resolve().as_posix()}",
+        f"RequiredStreams={required_streams}",
+        "RCSEnabled=1",
+        f"RCSPort={LABRECORDER_RCS_PORT}",
+        _LABRECORDER_CFG_MARKER_END,
+    ])
+
+    existing = cfg_path.read_text() if cfg_path.exists() else ""
+    if _LABRECORDER_CFG_MARKER_BEGIN in existing:
+        start = existing.index(_LABRECORDER_CFG_MARKER_BEGIN)
+        end = existing.index(_LABRECORDER_CFG_MARKER_END) + len(_LABRECORDER_CFG_MARKER_END)
+        existing = existing[:start] + existing[end:]
+    cfg_path.write_text(existing.rstrip("\n") + "\n\n" + managed_block + "\n")
+    logger.info("Wrote LabRecorder.cfg (StudyRoot=%s).", XDF_DIR.resolve())
+
+
+def start_lab_recorder() -> tuple[subprocess.Popen | None, bool]:
+    """Launches LabRecorder automatically and starts an XDF recording of every stream
+    matching its configured Required Streams list. _ensure_labrecorder_cfg()
+    writes that config itself"""
+    if os.environ.get("OW_NO_LABRECORDER"):
+        logger.info("OW_NO_LABRECORDER set; not auto-launching LabRecorder.")
+        return None, False
+
+    proc = None
+    sock = _connect_labrecorder_rcs(timeout=1.0)
+    if sock is None:
+        if LABRECORDER_EXE is None or not LABRECORDER_EXE.exists():
+            logger.warning(
+                "LabRecorder.exe not found under the repo (set OW_LABRECORDER_EXE); "
+                "skipping XDF recording. Looked for: %s",
+                LABRECORDER_EXE,
+            )
+            return None, False
+        _ensure_labrecorder_cfg()
+        proc = subprocess.Popen(
+            [str(LABRECORDER_EXE)], cwd=str(LABRECORDER_EXE.parent), **_SUBPROCESS_KWARGS
+        )
+        logger.info("Launched LabRecorder (pid=%s).", proc.pid)
+        sock = _connect_labrecorder_rcs(timeout=20.0)
+        if sock is None:
+            logger.warning(
+                "LabRecorder did not open its remote-control port (%s:%d). "
+                "Is 'EnableRCS' checked in its Config? Falling back to manual recording.",
+                LABRECORDER_RCS_HOST, LABRECORDER_RCS_PORT,
+            )
+            return proc, False
+
+    def send(cmd: str) -> None:
+        sock.sendall((cmd + "\n").encode("utf-8"))
+
+    try:
+        send("update")
+        time.sleep(2.0)  # let LabRecorder finish its network stream scan
+        send("select all")
+        time.sleep(0.3)
+        send(
+            "filename {root:%s} {participant:%s} {session:%s} {task:%s}"
+            % (XDF_DIR.resolve(), name_and_trial, SESSION_LABEL, name_and_trial)
+        )
+        time.sleep(0.3)
+        send("start")
+        time.sleep(0.5)
+    except OSError as e:
+        logger.warning("Failed to start LabRecorder recording over RCS: %s", e)
+        sock.close()
+        return proc, False
+    finally:
+        sock.close()
+
+    logger.info("LabRecorder recording started (XDF -> %s).", XDF_DIR.resolve())
+    return proc, True
+
+
+def stop_lab_recorder(proc: subprocess.Popen | None, started: bool) -> None: # COMEBACK TO THIS
+    """Stops the recording started by start_lab_recorder(), over a freshly
+    opened RCS connection (see start_lab_recorder()'s docstring for why this
+    doesn't reuse the original one). Leaves the LabRecorder process itself
+    running (even if we launched it) so the recorded file can be inspected
+    in the GUI.
+    """
+    if not started:
+        return
+    sock = _connect_labrecorder_rcs(timeout=5.0)
+    if sock is None:
+        logger.warning(
+            "Could not reach LabRecorder's remote-control port (%s:%d) to stop recording -- "
+            "stop it manually.", LABRECORDER_RCS_HOST, LABRECORDER_RCS_PORT,
+        )
+        return
+    try:
+        sock.sendall(b"stop\n")
+        logger.info("Sent stop command to LabRecorder.")
+    except OSError as e:
+        logger.warning("Failed to send stop command to LabRecorder: %s", e)
+    finally:
+        sock.close()
+
+
+# ============================================================
+# PsychoPy automation
+# ============================================================
+
+# PsychoPy task automation. Defaults to the 2-back task since that's the one
+# paired with LIFU triggering. Set OW_PSYCHOPY_SCRIPT to point at a different
+# Builder-exported script (e.g. stroop/stroop_lastrun.py) instead, or
+# OW_NO_PSYCHOPY=1 to skip auto-launching it and start the task by hand.
+PSYCHOPY_SCRIPT = Path(os.environ.get(
+    "OW_PSYCHOPY_SCRIPT",
+    str(Path(__file__).resolve().parent.parent.parent / "n-back-task-with-visual-stimuli" / "N-back_lastrun.py"),
+))
+# No portable default exists for the PsychoPy standalone interpreter -- it's
+# an external install, not part of this repo. Must be set via env var.
+_psychopy_python_override = os.environ.get("OW_PSYCHOPY_PYTHON")
+PSYCHOPY_PYTHON = Path(_psychopy_python_override) if _psychopy_python_override else None
+
+
+def start_psychopy() -> subprocess.Popen | None:
+    """Launches the PsychoPy task automatically as a subprocess with OW_PARTICIPANT set to
+    name_and_trial."""
+    if os.environ.get("OW_NO_PSYCHOPY"):
+        logger.info("OW_NO_PSYCHOPY set; not auto-launching the PsychoPy task.")
+        return None
+    if not PSYCHOPY_SCRIPT.exists():
+        logger.warning("PsychoPy script not found at %s; start it manually.", PSYCHOPY_SCRIPT)
+        return None
+    if PSYCHOPY_PYTHON is None or not PSYCHOPY_PYTHON.exists():
+        logger.warning(
+            "PsychoPy Python not found%s; set OW_PSYCHOPY_PYTHON to its path or start the "
+            "task manually.",
+            f" at {PSYCHOPY_PYTHON}" if PSYCHOPY_PYTHON is not None else "",
+        )
+        return None
+
+    env = dict(os.environ, OW_PARTICIPANT=name_and_trial)
+    proc = subprocess.Popen(
+        [str(PSYCHOPY_PYTHON), str(PSYCHOPY_SCRIPT)],
+        cwd=str(PSYCHOPY_SCRIPT.parent),
+        env=env,
+        **_SUBPROCESS_KWARGS,
+    )
+    logger.info("Launched PsychoPy task %s (pid=%s).", PSYCHOPY_SCRIPT.name, proc.pid)
+    return proc
+
+
+PSYCHOPY_STOP_SENTINEL = -1.0  # never used for a real LIFU_ON/OFF tick (those are 1.0/0.0)
+
+
+def stop_psychopy(proc: subprocess.Popen | None) -> None:
+    """Stops Psychopy cleanly on Control C and saves data. If it doesn't exit on its own within 8s of the stop signal, kills it."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        lifu_num_outlet.push_sample([PSYCHOPY_STOP_SENTINEL])
+    except Exception as e:
+        logger.warning("Failed to send PsychoPy stop signal over LSL: %s", e)
+    try:
+        proc.wait(timeout=8.0)
+        logger.info("PsychoPy exited on its own after the stop signal (data saved).")
+        return
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "PsychoPy didn't exit within 8s of the stop signal (maybe still on the "
+            "info dialog); forcing it closed -- its data for this run may not be saved."
+        )
+    _terminate_proc(proc)
+
+
+# Slicer remote-run automation on OpenLIFUSonicationControl's TCP listener 
+SLICER_RUN_HOST = "127.0.0.1"
+SLICER_RUN_PORT = int(os.environ.get("OW_SLICER_RUN_PORT", "18946"))
+
+
+def trigger_slicer_run(timeout: float = 5.0) -> bool:
+    try:
+        with socket.create_connection((SLICER_RUN_HOST, SLICER_RUN_PORT), timeout=timeout) as sock:
+            sock.sendall(b"run\n")
+            reply = sock.recv(1024).decode("utf-8", errors="ignore").strip()
+        if reply == "ok":
+            logger.info("Triggered Slicer's Run button over the remote-run listener.")
+            return True
+        logger.warning("Slicer remote-run listener replied unexpectedly: %r", reply)
+        return False
+    except OSError as e:
+        logger.warning(
+            "Could not reach Slicer's remote-run listener (%s:%d): %s. Is Slicer running "
+            "with the OpenLIFUSonicationControl module open, device connected, and solution "
+            "sent to hardware? Click Run manually instead.",
+            SLICER_RUN_HOST, SLICER_RUN_PORT, e,
+        )
+        return False
+
+
+def trigger_slicer_stop(timeout: float = 5.0) -> bool:
+    """Cleanly shuts off slicer sonication if hardware_enabled is False"""
+    try:
+        with socket.create_connection((SLICER_RUN_HOST, SLICER_RUN_PORT), timeout=timeout) as sock:
+            sock.sendall(b"stop\n")
+            reply = sock.recv(1024).decode("utf-8", errors="ignore").strip()
+        if reply == "ok":
+            logger.info("Triggered Slicer's Stop over the remote-run listener.")
+            return True
+        logger.warning("Slicer remote-run listener replied unexpectedly: %r", reply)
+        return False
+    except OSError as e:
+        logger.warning(
+            "Could not reach Slicer's remote-run listener (%s:%d) to stop the run: %s. "
+            "Stop it manually in Slicer if a sonication run is still active.",
+            SLICER_RUN_HOST, SLICER_RUN_PORT, e,
+        )
+        return False
+
+
+# ============================================================
+# LIFU hardware init
+# ============================================================
+
+# No portable default exists for the OpenLIFU db_dvc directory -- it's an
+# external asset, not part of this repo. Must be set via env var (or passed
+# to init_hardware(db_path=...) directly).
+_openlifu_db_override = os.environ.get("OW_OPENLIFU_DB")
+OPENLIFU_DB_PATH = Path(_openlifu_db_override) if _openlifu_db_override else None
+
+
+def init_hardware(
+    db_path: Path | None = None,
+    num_modules: int = 1,
+    use_external_power_supply: bool = False,
+    xInput: float = 0,
+    yInput: float = 0,
+    zInput: float = 50,
+    frequency_kHz: float = 400,
+    voltage: float = 20.0,
+    duration_msec: float = 3,
+    interval_msec: float = 10,
+) -> tuple[LIFUInterface, Solution]:
+    """initializes hardware on python if hardware_enabled"""
+    #peak_to_peak_voltage = voltage * 2
+    if db_path is None:
+        if OPENLIFU_DB_PATH is None:
+            raise RuntimeError(
+                "OpenLIFU database path not set. Pass db_path= explicitly or set "
+                "OW_OPENLIFU_DB to your OpenLIFU-python db_dvc directory."
+            )
+        db_path = OPENLIFU_DB_PATH
+    db = Database(db_path)
+    arr = db.load_transducer(f"openlifu_{num_modules}x400_evt1")
+    arr.sort_by_pin()
+
+    target = Point(position=(xInput, yInput, zInput), units="mm")
+    focus = target.get_position(units="mm")
+
+    positions = arr.get_positions(units="mm")
+    distances = np.sqrt(np.sum((focus - positions) ** 2, axis=1)).reshape(1, -1)
+
+    speed_of_sound = 1500
+    tof = distances * 1e-3 / speed_of_sound
+    delays = tof.max() - tof
+    apodizations = np.ones((1, arr.numelements()))
+    logger.info("Starting LIFU Test Script...")
+    interface = LIFUInterface(ext_power_supply=use_external_power_supply)
+    tx_connected, hv_connected = interface.is_device_connected()
+
+    interface.hvcontroller.turn_12v_on()
+    time.sleep(0.8)
+
+    interface.stop_monitoring()
+    del interface
+    interface = LIFUInterface(ext_power_supply=False)
+
+    tx_connected, hv_connected = interface.is_device_connected()
+    if not tx_connected:
+        raise RuntimeError("TX not connected after 12V power-up")
+
+    interface.hvcontroller.turn_hv_on()
+    time.sleep(0.5)
+
+    if not use_external_power_supply and not tx_connected:
+        logger.warning("TX device not connected. Attempting to turn on 12V...")
+        interface.hvcontroller.turn_hv_on()
+        time.sleep(2)
+        interface.hvcontroller.turn_12v_on()
+        time.sleep(2)
+        interface.stop_monitoring()
+        del interface
+        time.sleep(1)
+        logger.info("Reinitializing LIFU interface after powering 12V...")
+        interface = LIFUInterface(ext_power_supply=use_external_power_supply)
+        tx_connected, hv_connected = interface.is_device_connected()
+
+    if not use_external_power_supply:
+        if hv_connected:
+            logger.info(f"  HV Connected: {hv_connected}")
+        else:
+            raise RuntimeError("HV NOT fully connected.")
+    else:
+        logger.info("Using external power supply")
+
+    if tx_connected:
+        logger.info(f"  TX Connected: {tx_connected}")
+        logger.info("LIFU Device fully connected.")
+    else:
+        raise RuntimeError("TX NOT fully connected.")
+
+    if not interface.txdevice.ping():
+        raise RuntimeError("Failed to ping the transmitter device.")
+
+    if not use_external_power_supply and not interface.hvcontroller.ping():
+        raise RuntimeError("Failed to ping the console device.")
+
+    if not use_external_power_supply:
+        try:
+            console_firmware_version = interface.hvcontroller.get_version()
+            logger.info(f"Console Firmware Version: {console_firmware_version}")
+        except Exception as e:
+            logger.error(f"Error querying console firmware version: {e}")
+
+    try:
+        tx_firmware_version = interface.txdevice.get_version()
+        logger.info(f"TX Firmware Version: {tx_firmware_version}")
+    except Exception as e:
+        logger.error(f"Error querying TX firmware version: {e}")
+
+    logger.info("Enumerate TX7332 chips")
+    num_tx_devices = interface.txdevice.enum_tx7332_devices()
+    if num_tx_devices == 0:
+        raise ValueError("No TX7332 devices found.")
+    elif num_tx_devices == num_modules * 2:
+        logger.info(f"Number of TX7332 devices found: {num_tx_devices}")
+        numelements = 32 * num_tx_devices
+    else:
+        raise Exception(f"Number of TX7332 devices found: {num_tx_devices} != 2x{num_modules}")
+
+    logger.info(f'Apodizations: {apodizations}')
+    logger.info(f'Delays: {delays}')
+
+    pulse = Pulse(frequency=frequency_kHz * 1e3, duration=duration_msec * 1e-3)
+
+    sequence = Sequence(
+        pulse_interval=interval_msec * 1e-3,
+        pulse_count=int(60 / (interval_msec * 1e-3)),
+        pulse_train_interval=0,
+        pulse_train_count=1
+    )
+
+    pin_order = np.argsort([el.pin for el in arr.elements])
+
+    solution = Solution(
+        delays=delays[:, pin_order],
+        apodizations=apodizations[:, pin_order],
+        transducer=arr,
+        pulse=pulse,
+        voltage=voltage,
+        sequence=sequence
+    )
+
+    interface.set_solution(
+        solution=solution,
+        profile_index=1,
+        profile_increment=False,
+        trigger_mode="continuous"
+    )
+
+    logger.info("Beamforming solution loaded.")
+    return interface, solution
+
+
+
+
+# ============================================================
+# g.Pype router / channel-index config
+# ============================================================
+
+# g.Pype router input channels
+ROUTER_INPUT_CHANNELS = {
+    "channel_1": [0],
+    "channel_2": [1],
+    "channel_3": [2],
+    "channel_4": [3],
+    "channel_5": [4],
+    "channel_6": [5],
+    "channel_7": [6],
+    "theta_filter": [0],
+    "power": [0],
+    "moving_average": [0],
+    "theta_z": [0],
+    "hold": [0],
+    "channel_8": [7],
+}
+
+
+def _router_channel_index(input_channels: dict, port_name: str) -> int:
+    """takes router input_channels dict and returns the index of channel (For this, it's "hold')"""
+    idx = 0
+    for name, channels in input_channels.items():
+        if name == port_name:
+            return idx
+        idx += len(channels)
+    raise KeyError(f"{port_name!r} not in input_channels")
+
+
+THETA_CHANNEL_INDEX = _router_channel_index(ROUTER_INPUT_CHANNELS, "hold")  # channel I want to see
+
+
+# ============================================================
+# Theta closed-loop control
+# ============================================================
+
+SONICATION_TIME = 5 # seconds
+
+# Reconciled with triggers/conditions.py (see the import above): these four now default
+# to that module's values instead of a separate, possibly-drifted local copy.
+# COOLDOWN_TIME was 15 here vs. 10 in conditions.py before reconciliation; 15 is the
+# value actually used in the feasibility study, so conditions.py's COOLDOWN_SECONDS (and
+# its test and docs/protocol.md) were updated to 15 to match, rather than the other way
+# around. THETA_THRESHOLD_Z / ABS_VALUE_CUTOFF / MAX_SONICATIONS already agreed with
+# triggers/conditions.py's values, so aliasing them here just removes the duplication.
+COOLDOWN_TIME = COOLDOWN_SECONDS
+THETA_THRESHOLD_Z = THETA_TRIGGER_Z
+ABS_VALUE_CUTOFF = THETA_CEILING_Z
+MAX_SONICATIONS = SESSION_CAP
+
+MU = 2.32
+SIGMA =  6.60
+MAD_THRESHOLD = 10      # for artifact rejection in baseline collection -- not one of the
+                         # six trigger conditions; MAD/artifact gating runs upstream of them
+INITIAL_CUTOFF = 25.0   # initial power threshold to exclude extreme artifacts
+BUFFER_SIZE = 500
+BUFFER_COLLECTION_SIZE = 200 # minimum amount of samples to collect before the MAD buffer's
+                              # own median/MAD statistics are considered stable enough to use.
+                              # This is a separate concern from trigger condition 1 (baseline
+                              # complete) below -- see theta_trigger_loop's baseline_seconds.
+
+
+# Two independent readiness signals, set by two separate threads
+# from listen_for_start_stop() and theta_trigger_loop() itself
+baseline_ready = False # trigger condition 1: BASELINE_SECONDS of elapsed wall-clock time
+                        # collected (see theta_trigger_loop), not a sample count
+psychopy_running = False # can only sonicate while psychopy is running
+
+
+
+
+def listen_for_start_stop():
+    global psychopy_running
+    inlet = StreamInlet(resolve_byprop("name", "PsychoPyMarkers")[0])
+
+
+    while RUNNING:
+        sample, ts = inlet.pull_sample(timeout=0.1)
+        if sample is None:
+            continue
+        if sample[0] == "trial_start":
+            # Only send the START_EXPERIMENT_RECEIVED marker once, even if multiple trial_start markers are received
+            if not psychopy_running:
+                logger.info("Experiment started — enabling LIFU.")
+                eeg_trigger_outlet.push_sample(["START_EXPERIMENT_RECEIVED"])
+                psychopy_running = True
+        # stop signal received from psychopy, stop sending LIFU_ON markers
+        elif sample[0] == "STOP_EXPERIMENT":
+            if psychopy_running:
+                logger.info("Experiment ended — disabling LIFU.")
+                eeg_trigger_outlet.push_sample(["STOP_EXPERIMENT_RECEIVED"])
+            psychopy_running = False
+
+
+def theta_sample_source(stream_name='EEG_gpype', channel_index=THETA_CHANNEL_INDEX, timeout=0.01):
+    """Pulls LSL samples to feed to theta_trigger_loop"""
+    logger.info("Waiting for theta LSL stream (name=%r)...", stream_name)
+    streams = resolve_byprop('name', stream_name, timeout=30)
+    if not streams:
+        logger.error("No EEG LSL stream found for theta.")
+        return
+
+
+    inlet = StreamInlet(streams[0])
+    logger.info("Connected to EEG LSL stream for theta.")
+
+
+    while RUNNING:
+        sample, ts = inlet.pull_sample(timeout=timeout)
+        if sample is None:
+            continue
+        yield sample[channel_index], ts
+
+
+def theta_trigger_loop(
+    sample_source=None,
+    *,
+    interface=None,
+    sonication_time=SONICATION_TIME,
+    cooldown_time=COOLDOWN_TIME,
+    theta_threshold_z=THETA_THRESHOLD_Z,
+    mad_threshold=MAD_THRESHOLD,
+    abs_value_cutoff=ABS_VALUE_CUTOFF,
+    initial_cutoff=INITIAL_CUTOFF,
+    buffer_size=BUFFER_SIZE,
+    buffer_collection_size=BUFFER_COLLECTION_SIZE,
+    baseline_seconds=BASELINE_SECONDS,
+    max_sonications=MAX_SONICATIONS,
+):
+    """Applies theta-thresholding + cooldown/artifact-rejection logic to a
+    stream of (theta_val, ts) pairs and sends LIFU_ON/OFF markers over LSL.
+
+    The six conditions checked below mirror triggers/conditions.py's may_sonicate() one
+    for one (condition 1 = baseline_seconds, 2 = psychopy_running, 3 = theta_threshold_z,
+    4 = abs_value_cutoff, 5 = cooldown_time, 6 = max_sonications), using the same default
+    values. It's not implemented as a call to may_sonicate() itself because every one of
+    those defaults is overridden per-call somewhere in this repo's test suite (e.g.
+    cooldown_time=0.0, max_sonications=1, to keep tests fast) and conditions.py's
+    predicates read their thresholds as fixed module constants with no override hook.
+    """
+    global baseline_ready
+    NUM_SONICATIONS = 0
+    if sample_source is None:
+        sample_source = theta_sample_source()
+
+
+    #theta_history = []
+    last_trigger_time = 0
+    last_theta_val = None
+    baseline_start_ts = None  # set to the first sample's LSL timestamp, below
+    logger.info("Starting theta-based closed-loop monitoring...")
+    buffer = []
+
+
+    for theta_val, ts in sample_source:
+        if not RUNNING:
+            break
+        if last_theta_val is not None and theta_val == last_theta_val:
+            continue
+        last_theta_val = theta_val
+        if baseline_start_ts is None:
+            baseline_start_ts = ts
+        # update rolling buffer
+        # not enough data yet → just collect
+        if len(buffer) <= buffer_collection_size:
+            if theta_val < initial_cutoff:
+                buffer.append(theta_val)
+                eeg_trigger_outlet.push_sample(["collecting_baseline"])
+            continue
+        if len(buffer) > buffer_size:
+            buffer.pop(0)
+
+
+
+
+        arr = np.array(buffer)
+        median = np.median(arr)
+        mad = np.median(np.abs(arr - median)) + 1e-6
+
+
+        z = abs(theta_val - median) / mad
+
+
+        if z > mad_threshold:
+            logger.info(
+                f"Artifact detected: {theta_val:.1f} (median={median:.1f}, MAD={mad:.1f}, z={z:.1f})"
+            )
+            continue  # skip adding this sample to baseline
+
+
+        # clean sample → keep
+        buffer.append(theta_val)
+
+        now = ts
+        # Trigger condition 1: baseline_seconds of real elapsed time collected, matching
+        # triggers/conditions.py's baseline_complete() and docs/protocol.md's "100 s
+        # calibration baseline" -- not the buffer_collection_size sample count above,
+        # which is a separate, internal MAD-buffer warm-up threshold.
+        baseline_seconds_collected = now - baseline_start_ts
+        if not baseline_ready and baseline_seconds_collected >= baseline_seconds:
+            baseline_ready = True
+            logger.info(
+                "Baseline collection complete (%.1fs elapsed). Sonication gate open.",
+                baseline_seconds_collected,
+            )
+            eeg_trigger_outlet.push_sample(["baseline_collection_complete"])
+        logger.debug("baseline_ready=%s sonication_enabled=%s", baseline_ready, psychopy_running)
+
+        if (
+            baseline_ready
+            and psychopy_running
+            and theta_val < abs_value_cutoff
+            and theta_val > theta_threshold_z
+            and (now - last_trigger_time) >= cooldown_time
+            and NUM_SONICATIONS < max_sonications
+        ):
+            logger.info(f"Theta threshold crossed: z={theta_val:.2f}. Triggering LIFU.")
+            try:
+                eeg_trigger_outlet.push_sample(["LIFU_ON"])
+                trigger_started = False
+                if interface is not None:
+                    trigger_started = interface.txdevice.start_trigger()
+                    if not trigger_started:
+                        logger.error("Failed to start LIFU trigger.")
+                        continue
+                try:
+                    lifu_num_outlet.push_sample([1.0])
+                    NUM_SONICATIONS += 1
+
+
+                    time.sleep(sonication_time)
+                finally:
+                    if trigger_started and not interface.txdevice.stop_trigger():
+                        logger.error("Failed to stop LIFU trigger.")
+                eeg_trigger_outlet.push_sample(["LIFU_OFF"])
+                lifu_num_outlet.push_sample([0.0])
+
+
+                last_trigger_time = now
+                logger.info("Theta-triggered sonication complete.")
+            except Exception as e:
+                logger.error(f"Error during theta-triggered sonication: {e}")
+
+    return NUM_SONICATIONS
+
+
+# ============================================================
+# g.Pype pipeline
+# ============================================================
+
+fs = 250 # might not be used anywhere --> check
+
+
+def build_pipeline() -> tuple[gp.Pipeline, subprocess.Popen | None]:
+    """
+    build gpype pipeline for real time eeg processing/recording
+    """
+    p = gp.Pipeline()
+    source = gp.BCICore8()
+
+    bandpass = gp.Bandpass(f_lo = 1.0, f_hi = 30.0, order = 4)
+    theta_filter = gp.Bandpass(f_lo=4.0, f_hi=7.0, order=4)
+    notch60 = gp.Bandstop(f_lo=58, f_hi=62, order=4)
+
+
+    power = gp.Equation("in**2")
+    moving_average = gp.MovingAverage(window_size=50)
+    decimator = gp.Decimator(decimation_factor=10)
+    hold = gp.Hold()
+    theta_z_eq = gp.Equation(f"(in - {MU}) / {SIGMA}")
+    #theta_z_eq = gp.Equation("(in - 5.36) / 6.60") # MANUALLY CHANGE MU AND SIGMA
+
+
+
+    merger = gp.Router(
+        input_channels=ROUTER_INPUT_CHANNELS,
+        output_channels=[gp.Router.ALL],
+    )
+
+
+    sender = gp.LSLSender(stream_name = "EEG_gpype")
+
+
+    p.connect(source, notch60)
+    p.connect(notch60, bandpass)
+    p.connect(bandpass,theta_filter)
+    p.connect(theta_filter, power)
+    p.connect(power, moving_average)
+    p.connect(moving_average, theta_z_eq)
+    p.connect(theta_z_eq, decimator)
+    p.connect(decimator, hold)
+
+
+    p.connect(source, merger["channel_1"])
+    p.connect(source, merger["channel_2"])
+    p.connect(source, merger["channel_3"])
+    p.connect(source, merger["channel_4"])
+    p.connect(source, merger["channel_5"])
+    p.connect(source, merger["channel_6"])
+    p.connect(source, merger["channel_7"])
+    p.connect(theta_filter, merger["theta_filter"])
+    p.connect(power, merger["power"])
+    p.connect(moving_average, merger["moving_average"])
+    p.connect(hold, merger["hold"])
+    p.connect(theta_z_eq, merger["theta_z"])
+    p.connect(source, merger["channel_8"])
+
+
+
+
+    p.connect(merger, sender)
+
+
+    visualizer_proc = None
+    if not os.environ.get("OW_NO_VISUALIZER"):
+        visualizer_path = Path(__file__).resolve().parent.parent.parent / "scripts" / "lsl_visualizer.py"
+        try:
+            visualizer_proc = subprocess.Popen(
+                [sys.executable, str(visualizer_path)], **_SUBPROCESS_KWARGS
+            )
+            logger.info("Launched lsl_visualizer.py (pid=%s).", visualizer_proc.pid)
+        except OSError as e:
+            logger.warning("Could not launch lsl_visualizer.py: %s", e)
+
+
+    p.start()
+    logger.info(
+        "g.Pype pipeline running headless (no GUI scope). "
+        "lsl_visualizer.py shows all LSL streams (EEG_gpype, markers, etc.) "
+        "in real time. Set OW_NO_VISUALIZER=1 to disable auto-launch."
+    )
+    return p, visualizer_proc
+
+
+def wait_for_stop() -> None:
+    """Blocks until RUNNING is cleared (Ctrl+C or a stop trigger). The
+    g.Pype pipeline and lsl_visualizer.py built by build_pipeline() are torn
+    down separately, in main()'s own finally block, so that still happens
+    even if an exception is raised before this function is ever called.
+    """
+    try:
+        while RUNNING:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        logger.info("Pipeline interrupted, stopping g.Pype...")
+
+
+# ============================================================
+# Entrypoint
+# ============================================================
+
+def main() -> int:
+    global RUNNING
+    args = parse_args()
+    HARDWARE_ENABLED = args.hardware_enabled # CLI args
+    SHAM_RUN = args.sham_run
+    RUNNING = True
+    interface = None
+    theta_thread = None
+    psychopy_proc = None
+    lab_recorder_proc = None
+    lab_recorder_started = False
+    p = None
+    visualizer_proc = None
+    try:
+        if HARDWARE_ENABLED and SHAM_RUN:
+            logger.info(
+                "--sham-run set; skipping init_hardware() -- interface stays None, "
+                "so theta_trigger_loop runs its normal dry-run (markers emitted, no "
+                "hardware calls) and the LIFU will not sonicate this run."
+            )
+        elif HARDWARE_ENABLED:
+            # Bring up hardware (USB connect, 12V/HV power-on, TX7332 enumeration,
+            # beamforming solution) only when actually running this script with
+            # --hardware-enabled -- importing this module (e.g. for tests)
+            # never reaches here.
+            try:
+                interface, solution = init_hardware()
+            except RuntimeError as e:
+                logger.error("Hardware init failed: %s", e)
+                return 1
+
+        # Start thread to listen for experiment start/stop triggers from PsychoPy
+        listen_for_psychopy_thread = threading.Thread(target=listen_for_start_stop, daemon=True)
+        listen_for_psychopy_thread.start()
+
+
+        # Start theta closed-loop thread
+        theta_thread = threading.Thread(
+            target=theta_trigger_loop, kwargs={"interface": interface}, daemon=False
+        )
+        theta_thread.start()
+
+
+        # Start the PsychoPy task now that the marker/EEG plumbing it talks
+        # to is already listening.
+        psychopy_proc = start_psychopy()
+        p, visualizer_proc = build_pipeline()
+        lab_recorder_proc, lab_recorder_started = start_lab_recorder()
+        if HARDWARE_ENABLED:
+            pass
+        elif SHAM_RUN:
+            logger.info(
+                "--sham-run set; skipping the Slicer auto-run trigger -- Slicer "
+                "stays unarmed, so the LIFU will not sonicate this run."
+            )
+        else:
+            if not trigger_slicer_run():
+                logger.error("Slicer run command failed; aborting startup with sonication unarmed.")
+                return 1
+
+
+        # Block here until Ctrl+C or a stop trigger; the pipeline itself is
+        # already running (started by build_pipeline() above).
+        wait_for_stop()
+
+
+    finally:
+            # clean exit: stop the g.Pype pipeline, lsl_visualizer.py, PsychoPy, LabRecorder, and Slicer (if applicable)
+            RUNNING = False
+            if not HARDWARE_ENABLED and not SHAM_RUN:
+                # stops slicer's sonication run
+                _cleanup_step("stop Slicer's sonication run", trigger_slicer_stop)
+            if p is not None:
+                _cleanup_step("stop g.Pype pipeline", p.stop)
+            _cleanup_step("terminate lsl_visualizer.py", _terminate_proc, visualizer_proc)
+            _cleanup_step("stop PsychoPy", stop_psychopy, psychopy_proc)
+            _cleanup_step("stop LabRecorder", stop_lab_recorder, lab_recorder_proc, lab_recorder_started)
+            if interface is not None:
+                _cleanup_step("turn off LIFU HV", interface.hvcontroller.turn_hv_off)
+            if theta_thread is not None:
+                _cleanup_step("join theta thread", theta_thread.join)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

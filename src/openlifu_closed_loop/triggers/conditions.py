@@ -18,7 +18,9 @@ from dataclasses import dataclass
 # --- Thresholds (mirror docs/protocol.md) ---
 THETA_TRIGGER_Z = 1.5      # condition 3: theta Z above which a sonication may be triggered
 THETA_CEILING_Z = 10.0     # condition 4: hard safety ceiling; at/above this we refuse
-COOLDOWN_SECONDS = 10.0    # condition 5: minimum spacing between sonications
+COOLDOWN_SECONDS = 15.0    # condition 5: minimum spacing between sonications -- reconciled
+                           # to match main_pipeline.py's COOLDOWN_TIME, the value actually
+                           # used in the feasibility study (this was 10.0 pre-migration)
 SESSION_CAP = 10           # condition 6: maximum sonications per session
 BASELINE_SECONDS = 100.0   # condition 1: required calibration baseline length
 

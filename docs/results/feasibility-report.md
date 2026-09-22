@@ -69,13 +69,20 @@ assembled into a real-time closed loop that behaves within defined bounds.
 
 ## Reproducing without human data
 
-The full pipeline — calibration, Z-score, trigger gate, logging — can be exercised
-against the synthetic theta fixture with no human recordings:
+The trigger gate itself — the six-condition safety-critical surface this report's
+findings are about — can be exercised directly with no human recordings and no
+hardware:
 
 ```bash
-python -m fixtures.synthetic_theta
-python -m openlifu_closed_loop --source synthetic --dry-run
+pytest tests/test_trigger_conditions.py
 ```
 
-This is the recommended way to inspect the system's real-time behavior and the trigger
-gate independently of any subject data.
+The full pipeline (calibration → Z-score → trigger gate → sonication → logging) as
+actually built and used for this study requires the g.Pype SDK and a connected g.tec
+amplifier; there is not currently a synthetic-source mode for it, and the scaffold's
+`python -m openlifu_closed_loop --source synthetic --dry-run` entrypoint is not wired to
+it (see [`../known-issues.md`](../known-issues.md#current-implementation-status)). The
+synthetic signal generator ([`../../fixtures/synthetic_theta.py`](../../fixtures/synthetic_theta.py))
+streams a configurable theta-band signal onto LSL and can be run standalone
+(`python -m fixtures.synthetic_theta`), but nothing in this repository currently
+consumes it end-to-end.

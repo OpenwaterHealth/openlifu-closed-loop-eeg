@@ -1,5 +1,13 @@
 # Calibration
 
+> [!NOTE]
+> This document describes the **intended** per-session calibration design. As migrated,
+> `main_pipeline.py` computes `theta_z` against a **fixed, hardcoded `MU`/`SIGMA`**
+> (derived once, offline, via `EEG_calibration.py`, then hand-substituted into
+> `main_pipeline.py`'s constants) rather than the fresh `baseline_mean`/`baseline_std`
+> this document describes computing each session. See
+> [`known-issues.md`](known-issues.md#current-implementation-status).
+
 The trigger gate acts on a **theta-band Z-score** — how far the subject's current theta
 power is from *their own* resting baseline, in standard-deviation units. This document
 describes how that baseline is collected and how the Z-score is computed online.
@@ -15,8 +23,7 @@ theta amplitudes.
 At the start of every session, the subject sits at rest while the pipeline collects a
 **100-second baseline** of theta-band power. During this window:
 
-- No sonications are permitted (trigger condition 1 — *baseline buffer complete* — is
-  false until the full 100 s has been collected).
+- EEG is passed through a real time processing (notch, bandpass, power, moving average, z-score)
 - Samples still pass through the artifact-gating stage, so contaminated segments do not
   corrupt the baseline statistics.
 
@@ -49,13 +56,12 @@ excursion, and the gate refuses to sonicate rather than acting on it. See
 
 ## 3. Practical notes
 
-- **`baseline_std` must be non-zero.** A degenerate baseline (e.g. a flat or clipped
-  signal) yields an undefined Z-score; the pipeline treats this as a fail-closed
-  condition and does not permit sonication.
 - **Baseline quality gates everything downstream.** If the artifact-gating flag rate is
   high during the 100 s window, the baseline is untrustworthy — re-check electrode
   impedance and coupling (see [`hardware-setup.md`](hardware-setup.md)) and recalibrate.
-- **The synthetic fixture calibrates too.** Running against
-  [`../fixtures/synthetic_theta.py`](../fixtures/synthetic_theta.py) exercises the full
-  100 s baseline → Z-score → trigger path with no human data, which is the recommended
-  way to verify calibration behavior.
+- **The synthetic fixture does not currently exercise this path end-to-end.**
+  [`../fixtures/synthetic_theta.py`](../fixtures/synthetic_theta.py) streams a synthetic
+  theta-band signal onto LSL, but `main_pipeline.py`'s acquisition step is hardwired to
+  a real g.tec amplifier (`gp.BCICore8()`) — nothing in this repository currently
+  consumes the synthetic stream through the baseline → Z-score → trigger path. See
+  [`known-issues.md`](known-issues.md#current-implementation-status).

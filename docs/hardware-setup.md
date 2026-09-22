@@ -12,12 +12,13 @@ installation of the proprietary g.Pipe SDK.
 | Item | Notes |
 |------|-------|
 | g.tec EEG amplifier + electrode set | The reference amplifier for this implementation |
-| g.Pipe SDK | **Proprietary, user-supplied** — see [Installing the g.Pipe SDK](#installing-the-gpipe-sdk) |
+| g.Pipe SDK | **User-supplied** — see [Installing the g.Pipe SDK](#installing-the-gpipe-sdk) |
 | EEG cap | Sized to the subject |
 | Conductive gel | For electrode–scalp impedance |
 | OpenLIFU transducer + drive hardware | Per the OpenLIFU platform documentation |
 | Acoustic coupling medium | For LIFU–scalp coupling |
 | Host computer | Runs acquisition, task, trigger, and LIFU control over LSL |
+| 3D Slicer + SlicerOpenLIFU | Only for the default (non-`--hardware-enabled`) run path — see [Installing the vendored Slicer module](#installing-the-vendored-slicer-module) |
 
 ---
 
@@ -36,8 +37,7 @@ planned so that neither compromises the other:
   *before* starting calibration.
 
 > [!NOTE]
-> This pipeline does **not** perform MRI-guided targeting or acoustic skull correction.
-> Transducer placement is manual and anatomical. Those are tracked as open enhancement
+> Transducer placement is manual and anatomical for this study, however MR-guided targetting is possible. Those are tracked as open enhancement
 > items in [`known-issues.md`](known-issues.md) and are design decisions for the
 > platform owners, not something this feasibility implementation resolves.
 
@@ -53,16 +53,47 @@ license from g.tec.
 2. Install it per g.tec's instructions for your platform.
 3. Make the SDK importable in the environment where you run this pipeline (e.g. on the
    `PYTHONPATH`, or installed into the same virtual environment).
-4. Verify the acquisition adapter can import it:
+4. Verify it's importable:
 
    ```bash
-   python -c "import openlifu_closed_loop.acquisition as a; a.check_gpipe()"
+   python -c "import gpype"
    ```
 
-If you use a **different amplifier**, you do not need the g.Pipe SDK. Implement the
-acquisition interface for your hardware instead (see
-[`architecture.md`](architecture.md#module-boundaries)) — this is an explicitly
-supported extension point, and adapter contributions are welcome.
+   `src/openlifu_closed_loop/main_pipeline.py` (the migrated pipeline) imports `gpype`
+   directly and unconditionally today — there is no separate acquisition adapter module
+   to check yet (see [`known-issues.md`](known-issues.md#current-implementation-status)).
+
+If you use a **different amplifier**, you do not need the g.Pipe SDK, but you will need
+to adapt `main_pipeline.py`'s g.Pype-specific pipeline construction (`build_pipeline()`)
+to your hardware directly — the acquisition-interface extension point described in
+[`architecture.md`](architecture.md#module-boundaries) is the intended design, not yet
+how the migrated code is structured. Adapter contributions are welcome regardless.
+
+---
+
+## Installing the vendored Slicer module
+
+`main_pipeline.py`'s default run path (without `--hardware-enabled`) triggers and stops
+sonication over TCP against a listener running inside 3D Slicer's
+`OpenLIFUSonicationControl` module. One file from that module, modified specifically for
+this experiment, is vendored in
+[`third_party/SlicerOpenLIFU/`](../third_party/SlicerOpenLIFU) — see that directory's
+[`README.md`](../third_party/SlicerOpenLIFU/README.md) for exactly what's modified and
+the AGPL-3.0 licensing detail (separate from this repository's own Apache-2.0 license;
+see [`NOTICE`](../NOTICE)). Everything else — `OpenLIFULib`, the rest of
+`OpenLIFUSonicationControl/`, every other module — comes from a normal SlicerOpenLIFU
+install; none of it is vendored here.
+
+1. Install 3D Slicer and the upstream
+   [SlicerOpenLIFU](https://github.com/OpenwaterHealth/SlicerOpenLIFU) extension per its
+   own [releases](https://github.com/OpenwaterHealth/SlicerOpenLIFU/releases).
+2. In that installation, replace `OpenLIFUSonicationControl/OpenLIFUSonicationControl.py`
+   with the version in `third_party/SlicerOpenLIFU/OpenLIFUSonicationControl/`.
+3. Open Slicer with the `OpenLIFUSonicationControl` module loaded, with a device connected
+   and a solution sent to hardware, before starting `main_pipeline.py`.
+
+If you only ever run with `--hardware-enabled` (headless, no Slicer GUI), none of this is
+needed.
 
 ---
 
@@ -72,6 +103,9 @@ supported extension point, and adapter contributions are welcome.
 - [ ] Electrode impedances acceptable, including electrodes adjacent to the transducer
 - [ ] Artifact-gating flag rate low on resting subject
 - [ ] Task (PsychoPy 2-back) launches and publishes markers to LSL
-- [ ] LIFU control reachable; run once in `--dry-run` to confirm the trigger→LIFU path
-      logs decisions without issuing sonications
+- [ ] LIFU control reachable; run `main_pipeline.py --sham-run` once to confirm the
+      trigger→LIFU path logs decisions without issuing sonications (`--sham-run` skips
+      hardware init and the Slicer auto-run trigger; note this is `main_pipeline.py`'s
+      own flag, not the scaffold's `--dry-run`, which isn't wired to anything yet — see
+      [`known-issues.md`](known-issues.md#current-implementation-status))
 - [ ] Logging is writing to the intended output location

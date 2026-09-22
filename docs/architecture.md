@@ -10,36 +10,36 @@ independently.
 ## LSL topology
 
 ```
-        ┌──────────────────────┐
+        ┌───────────────────────┐
         │  g.tec amplifier      │
         │  (or synthetic_theta) │
-        └──────────┬───────────┘
+        └──────────┬────────────┘
                    │  raw EEG  (LSL stream: "EEG")
                    ▼
-        ┌──────────────────────┐
-        │  acquisition/        │  g.Pipe SDK adapter → LSL
-        └──────────┬───────────┘
+        ┌────────────────────────────┐
+        │  Real Time EEG Processing  │  g.Pipe SDK adapter → LSL
+        └──────────┬─────────────────┘
                    │  EEG samples
                    ▼
         ┌──────────────────────┐
-        │  artifact_gating/    │  MAD gate, 500-sample rolling buffer
+        │  artifact_gating     │  MAD gate, 500-sample rolling buffer
         └──────────┬───────────┘
                    │  clean samples + gate flag
                    ▼
         ┌──────────────────────┐        ┌────────────────────┐
-        │  triggers/           │◀───────│  task/ (PsychoPy    │
-        │  six-condition gate  │  task  │  2-back)  LSL       │
-        │  + safety ceiling    │  state │  markers            │
+        │  triggers/           │◀──────│  task/ (PsychoPy   │
+        │  six-condition gate  │  task  │  2-back)  LSL      │
+        │  + safety ceiling    │  state │  markers           │
         └──────────┬───────────┘        └────────────────────┘
                    │  "sonicate" decision
                    ▼
         ┌──────────────────────┐
-        │  lifu/               │  openlifu-python interface
+        │  lifu               │  openlifu-python and 3D Slicer interface
         └──────────┬───────────┘
                    │
                    ▼
         ┌──────────────────────┐
-        │  logging/            │  timestamped event log (all streams)
+        │  logging (LSL)       │  timestamped event log (all streams)
         └──────────────────────┘
 ```
 

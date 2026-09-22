@@ -17,7 +17,7 @@ def _ready_state(**overrides) -> LoopState:
         baseline_seconds_collected=100.0,
         task_active=True,
         theta_z=2.0,                       # > 1.5 and < 10
-        seconds_since_last_sonication=15.0,
+        seconds_since_last_sonication=20.0,  # >= COOLDOWN_SECONDS (15.0)
         sonication_count=0,
     )
     base.update(overrides)
@@ -54,7 +54,7 @@ def test_condition_4_theta_at_or_above_ceiling_blocks():
 
 
 def test_condition_5_cooldown_not_elapsed_blocks():
-    state = _ready_state(seconds_since_last_sonication=9.9)
+    state = _ready_state(seconds_since_last_sonication=14.9)
     assert not may_sonicate(state)
     assert "cooldown_elapsed" in blocking_conditions(state)
 

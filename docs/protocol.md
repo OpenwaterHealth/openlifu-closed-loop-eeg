@@ -65,7 +65,7 @@ test per condition.
 | 2 | **Task active** | The 2-back task is currently running | Sonication is only meaningful in the behavioral context the study is about. |
 | 3 | **Theta Z above trigger** | `theta_z > 1.5` | The event the loop is closing on: elevated theta relative to the subject's own baseline. |
 | 4 | **Below safety ceiling** | `theta_z < 10` | A hard ceiling. A Z-score at or above 10 indicates an implausible/artefactual excursion; the gate refuses to sonicate rather than act on it. |
-| 5 | **Cooldown elapsed** | `now - last_sonication >= 10 s` | Enforces a minimum spacing between sonications. |
+| 5 | **Cooldown elapsed** | `now - last_sonication >= 15 s` | Enforces a minimum spacing between sonications. |
 | 6 | **Session cap not reached** | `sonication_count < 10` | A hard per-session ceiling on total sonications. |
 
 ### Design notes
@@ -83,11 +83,3 @@ test per condition.
 > module and this table are what should be read together. Keep them in sync: a change to
 > a threshold here must correspond to a change in the module and its test.
 
----
-
-## 5. Logging
-
-Every sonication decision — permitted or refused — is logged with the state of all six
-conditions at decision time, plus a timestamp on the LSL clock. This makes the gate's
-behavior fully auditable offline and is the basis for the latency analysis in
-[`../notebooks/latency_analysis.ipynb`](../notebooks/latency_analysis.ipynb).

@@ -27,6 +27,18 @@ g.Pipe SDK (proprietary, g.tec)
   redistributed with this repository. Users must obtain and license it directly from
   g.tec. See docs/hardware-setup.md.
 
+SlicerOpenLIFU, one modified file (AGPL-3.0)
+  third_party/SlicerOpenLIFU/ vendors exactly one file,
+  OpenLIFUSonicationControl/OpenLIFUSonicationControl.py, modified from Openwater's
+  SlicerOpenLIFU 3D Slicer extension (https://github.com/OpenwaterHealth/SlicerOpenLIFU),
+  licensed under AGPL-3.0. It is modified from upstream specifically for this
+  repository's closed-loop experiment and is not a redistribution of SlicerOpenLIFU, or
+  even of the rest of that module, as a whole -- install SlicerOpenLIFU normally from its
+  own releases for everything else. Openwater holds copyright on both SlicerOpenLIFU and
+  this repository. This repository's own code (main_pipeline.py) communicates with this
+  vendored code only over a TCP socket, not a Python import. See
+  third_party/SlicerOpenLIFU/README.md and third_party/SlicerOpenLIFU/LICENSE.
+
 ------------------------------------------------------------------------------
 Research-use notice
 ------------------------------------------------------------------------------
