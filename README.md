@@ -1,5 +1,9 @@
 # openlifu-closed-loop-eeg
 
+## Disclaimer
+
+CAUTION - Investigational device. Limited by Federal (or United States) law to investigational use. The system described here has not been evaluated by the FDA and is not designed for the treatment or diagnosis of any disease. It is provided AS-IS, with no warranties. User assumes all liability and responsibility for identifying and mitigating risks associated with using this software.
+
 A reference implementation of **closed-loop low-intensity focused ultrasound (LIFU)
 driven by real-time EEG**, built on the [OpenLIFU](https://github.com/OpenwaterHealth)
 platform and open hardware.
